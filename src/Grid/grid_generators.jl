@@ -1,3 +1,5 @@
+using Base.Iterators: product
+
 function boundaries_to_sparse(boundary)
     n = length(boundary)
     I = Vector{Int}(n)
@@ -317,65 +319,39 @@ function generate_grid(::Type{QuadraticTriangle}, nel::NTuple{2,Int}, LL::Vec{2,
     return Grid(cells, nodes, facesets=facesets, boundary_matrix=boundary_matrix)
 end
 
-# Tetrahedron
+@generated function get_cube(node_xyz, i, j, k)
+    corners = ((0,0,0), (1,0,0), (1,1,0), (0,1,0), (0,0,1), (1,0,1), (1,1,1), (0,1,1))
+    Expr(:tuple, Tuple(:(node_xyz[i + $di, j + $dj, k + $dk]) for (di, dj, dk) in corners)...)
+end
+
+@generated function get_tets(cube)
+    cube_tets = ((1,2,4,8), (1,5,2,8), (2,3,4,8), (2,7,3,8), (2,5,6,8), (2,6,7,8))
+    return Expr(:tuple, Tuple(Expr(:tuple, Tuple(:(cube[$x]) for x in tet)...) for tet in cube_tets)...)
+end
+
 function generate_grid(::Type{Tetrahedron}, cells_per_dim::NTuple{3,Int}, left::Vec{3,T}=Vec{3}((-1.0,-1.0,-1.0)), right::Vec{3,T}=Vec{3}((1.0,1.0,1.0))) where {T}
+    tets_per_cube = 6
     nodes_per_dim = cells_per_dim .+ 1
-
-    cells_per_cube = 6
     total_nodes = prod(nodes_per_dim)
-    total_elements = cells_per_cube * prod(cells_per_dim)
+    total_elements = tets_per_cube * prod(cells_per_dim)
+    node_xyz = reshape(1:total_nodes, nodes_per_dim)
 
-    n_nodes_x, n_nodes_y, n_nodes_z = nodes_per_dim
-    n_cells_x, n_cells_y, n_cells_z = cells_per_dim
-
-    # Generate nodes
-    coords_x = linspace(left[1], right[1], n_nodes_x)
-    coords_y = linspace(left[2], right[2], n_nodes_y)
-    coords_z = linspace(left[3], right[3], n_nodes_z)
-    numbering = reshape(1:total_nodes, nodes_per_dim)
-
-    # Pre-allocate the nodes & cells
-    nodes = Vector{Node{3,T}}(total_nodes)
+    X = linspace.(left.data, right.data, nodes_per_dim)
+    nodes = reshape([Node(coord) for coord in product(X...)], :)
     cells = Vector{Tetrahedron}(total_elements)
-    
-    # Generate nodes
-    node_idx = 1
-    @inbounds for k in 1:n_nodes_z, j in 1:n_nodes_y, i in 1:n_nodes_x
-        nodes[node_idx] = Node((coords_x[i], coords_y[j], coords_z[k]))
-        node_idx += 1
+
+    @inbounds for (i, I) = enumerate(CartesianRange(cells_per_dim))
+        idx = tets_per_cube * (i - 1)
+        tets = get_tets(get_cube(node_xyz, I.I...))
+        for m = 1 : tets_per_cube
+            cells[idx + m] = Tetrahedron(tets[m])
+        end
     end
 
-    # Generate cells, case 1 from: http://www.baumanneduard.ch/Splitting%20a%20cube%20in%20tetrahedras2.htm
-    # cube = (1, 2, 3, 4, 5, 6, 7, 8)
-    # left = (1, 4, 5, 8), right = (2, 3, 6, 7)
-    # front = (1, 2, 5, 6), back = (3, 4, 7, 8)
-    # bottom = (1, 2, 3, 4), top = (5, 6, 7, 8)
-    cell_idx = 0
-    @inbounds for k in 1:n_cells_z, j in 1:n_cells_y, i in 1:n_cells_x
-        cell = (
-            numbering[i  , j  , k],
-            numbering[i+1, j  , k], 
-            numbering[i+1, j+1, k],
-            numbering[i  , j+1, k],
-            numbering[i  , j  , k+1],
-            numbering[i+1, j  , k+1],
-            numbering[i+1, j+1, k+1],
-            numbering[i  , j+1, k+1]
-        )
-
-        cells[cell_idx + 1] = Tetrahedron((cell[1], cell[2], cell[4], cell[8]))
-        cells[cell_idx + 2] = Tetrahedron((cell[1], cell[5], cell[2], cell[8]))
-        cells[cell_idx + 3] = Tetrahedron((cell[2], cell[3], cell[4], cell[8]))
-        cells[cell_idx + 4] = Tetrahedron((cell[2], cell[7], cell[3], cell[8]))
-        cells[cell_idx + 5] = Tetrahedron((cell[2], cell[5], cell[6], cell[8]))
-        cells[cell_idx + 6] = Tetrahedron((cell[2], cell[6], cell[7], cell[8]))
-
-        cell_idx += cells_per_cube
-    end
-
-    # Order the cells as c_nxyz[n, x, y, z] such that we can look up boundary cells
-    c_nxyz = reshape(1:total_elements, (cells_per_cube, cells_per_dim...))
-
+    # Order the cells as c_nxyz[n, x, y, z] so that we can look up boundary cells
+    # left = (1, 4, 5, 8), right = (2, 3, 6, 7), front = (1, 2, 5, 6)
+    # back = (3, 4, 7, 8), bottom = (1, 2, 3, 4), top = (5, 6, 7, 8)
+    c_nxyz = reshape(1:total_elements, (tets_per_cube, cells_per_dim...))
     @views le = [map(x -> (x,4), c_nxyz[1, 1, :, :][:])   ; map(x -> (x,2), c_nxyz[2, 1, :, :][:])]
     @views ri = [map(x -> (x,1), c_nxyz[4, end, :, :][:]) ; map(x -> (x,1), c_nxyz[6, end, :, :][:])]
     @views fr = [map(x -> (x,1), c_nxyz[2, :, 1, :][:])   ; map(x -> (x,1), c_nxyz[5, :, 1, :][:])]
